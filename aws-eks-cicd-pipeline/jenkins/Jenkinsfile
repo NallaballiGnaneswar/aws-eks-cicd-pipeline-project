@@ -1,0 +1,236 @@
+pipeline {
+    agent any
+
+    environment {
+        // AWS Configuration
+        AWS_ACCOUNT_ID      = credentials('aws-account-id')
+        AWS_DEFAULT_REGION   = 'ap-south-1'
+        ECR_REPO_NAME        = 'aws-eks-cicd-demo'
+        ECR_REGISTRY         = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com"
+        IMAGE_TAG            = "${BUILD_NUMBER}-${GIT_COMMIT[0..7]}"
+        DOCKER_IMAGE         = "${ECR_REGISTRY}/${ECR_REPO_NAME}:${IMAGE_TAG}"
+
+        // Kubernetes Configuration
+        EKS_CLUSTER_NAME     = 'my-eks-cluster'
+        K8S_NAMESPACE        = 'production'
+
+        // SonarQube Configuration
+        SONAR_HOST_URL       = credentials('sonar-host-url')
+        SONAR_TOKEN          = credentials('sonar-token')
+    }
+
+    tools {
+        maven 'Maven-3.9'
+        jdk   'JDK-17'
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timestamps()
+    }
+
+    stages {
+
+        // ========================================
+        // Stage 1: Checkout Source Code
+        // ========================================
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code...'
+                checkout scm
+                script {
+                    env.GIT_COMMIT_MSG = sh(
+                        script: 'git log -1 --pretty=%B',
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+
+        // ========================================
+        // Stage 2: Build Application
+        // ========================================
+        stage('Build') {
+            steps {
+                echo 'Building application...'
+                dir('app') {
+                    sh 'mvn clean compile -B'
+                }
+            }
+        }
+
+        // ========================================
+        // Stage 3: Run Unit Tests
+        // ========================================
+        stage('Unit Tests') {
+            steps {
+                echo 'Running unit tests...'
+                dir('app') {
+                    sh 'mvn test -B'
+                }
+            }
+            post {
+                always {
+                    junit 'app/target/surefire-reports/*.xml'
+                    jacoco(
+                        execPattern: 'app/target/jacoco.exec',
+                        classPattern: 'app/target/classes',
+                        sourcePattern: 'app/src/main/java'
+                    )
+                }
+            }
+        }
+
+        // ========================================
+        // Stage 4: SonarQube Code Quality Analysis
+        // ========================================
+        stage('SonarQube Analysis') {
+            steps {
+                echo 'Running SonarQube analysis...'
+                dir('app') {
+                    withSonarQubeEnv('SonarQube-Server') {
+                        sh """
+                            mvn sonar:sonar \\
+                                -Dsonar.projectKey=aws-eks-cicd-pipeline \\
+                                -Dsonar.projectName='AWS EKS CICD Pipeline' \\
+                                -Dsonar.host.url=\${SONAR_HOST_URL} \\
+                                -Dsonar.login=\${SONAR_TOKEN} \\
+                                -Dsonar.java.coveragePlugin=jacoco \\
+                                -Dsonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+                        """
+                    }
+                }
+            }
+        }
+
+        // ========================================
+        // Stage 5: SonarQube Quality Gate
+        // ========================================
+        stage('Quality Gate') {
+            steps {
+                echo 'Checking SonarQube Quality Gate...'
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // ========================================
+        // Stage 6: Package Application (JAR)
+        // ========================================
+        stage('Package') {
+            steps {
+                echo 'Packaging application...'
+                dir('app') {
+                    sh 'mvn package -DskipTests -B'
+                }
+            }
+        }
+
+        // ========================================
+        // Stage 7: Build Docker Image
+        // ========================================
+        stage('Docker Build') {
+            steps {
+                echo 'Building Docker image...'
+                dir('app') {
+                    sh "docker build -t ${DOCKER_IMAGE} ."
+                    sh "docker tag ${DOCKER_IMAGE} ${ECR_REGISTRY}/${ECR_REPO_NAME}:latest"
+                }
+            }
+        }
+
+        // ========================================
+        // Stage 8: Push Docker Image to AWS ECR
+        // ========================================
+        stage('Push to ECR') {
+            steps {
+                echo 'Pushing Docker image to AWS ECR...'
+                sh """
+                    aws ecr get-login-password --region \${AWS_DEFAULT_REGION} | \\
+                    docker login --username AWS --password-stdin \${ECR_REGISTRY}
+                """
+                sh "docker push ${DOCKER_IMAGE}"
+                sh "docker push ${ECR_REGISTRY}/${ECR_REPO_NAME}:latest"
+            }
+        }
+
+        // ========================================
+        // Stage 9: Deploy to AWS EKS
+        // ========================================
+        stage('Deploy to EKS') {
+            steps {
+                echo 'Deploying to AWS EKS...'
+                sh """
+                    aws eks update-kubeconfig \\
+                        --name \${EKS_CLUSTER_NAME} \\
+                        --region \${AWS_DEFAULT_REGION}
+                """
+
+                // Update image tag in deployment manifest
+                sh """
+                    sed -i 's|IMAGE_PLACEHOLDER|${DOCKER_IMAGE}|g' k8s/deployment.yaml
+                """
+
+                // Apply Kubernetes manifests
+                sh """
+                    kubectl apply -f k8s/namespace.yaml
+                    kubectl apply -f k8s/configmap.yaml
+                    kubectl apply -f k8s/deployment.yaml
+                    kubectl apply -f k8s/service.yaml
+                    kubectl apply -f k8s/ingress.yaml
+                    kubectl apply -f k8s/hpa.yaml
+                """
+
+                // Verify deployment
+                sh """
+                    kubectl rollout status deployment/eks-cicd-demo \\
+                        -n \${K8S_NAMESPACE} --timeout=300s
+                """
+            }
+        }
+
+        // ========================================
+        // Stage 10: Verify Deployment
+        // ========================================
+        stage('Verify') {
+            steps {
+                echo 'Verifying deployment...'
+                sh """
+                    kubectl get pods -n \${K8S_NAMESPACE} -l app=eks-cicd-demo
+                    kubectl get svc -n \${K8S_NAMESPACE} -l app=eks-cicd-demo
+                """
+            }
+        }
+    }
+
+    // ========================================
+    // Post Actions
+    // ========================================
+    post {
+        success {
+            echo 'Pipeline completed successfully!'
+            // Uncomment below for Slack notifications
+            // slackSend(
+            //     channel: '#deployments',
+            //     color: 'good',
+            //     message: "SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nCommit: ${env.GIT_COMMIT_MSG}"
+            // )
+        }
+        failure {
+            echo 'Pipeline failed!'
+            // slackSend(
+            //     channel: '#deployments',
+            //     color: 'danger',
+            //     message: "FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}\nCommit: ${env.GIT_COMMIT_MSG}"
+            // )
+        }
+        always {
+            // Clean up Docker images
+            sh 'docker system prune -f || true'
+            cleanWs()
+        }
+    }
+}
